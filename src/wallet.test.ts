@@ -2,11 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IndexerGetTransactionResultResponse } from "@tari-project/ootle-ts-bindings";
 import type { IndexerProvider } from "@tari-project/ootle-indexer";
 import type { ShieldedOutputRecord } from "./storage";
+import { inMemoryAdapter } from "./adapters";
+import { addPendingShield, addShieldedOutput, configureOotleStorage, listPendingShields, listShieldedOutputs } from "./storage";
 import {
   assertValidMinimumValuePromise,
   extractMissingSubstateAddress,
   extractStaleLockVersion,
   pollTransactionResult,
+  recoverPendingShields,
+  FeeCommittedError,
   resolveInputsWithRetry,
   resolveSendPrivatelyPlan,
   resolveUnshieldPlan,
@@ -239,6 +243,13 @@ describe("pollTransactionResult", () => {
   it("throws on a Finalized/AcceptFeeRejectRest outcome", async () => {
     const response = finalizedWith({ AcceptFeeRejectRest: [{ up_substates: [] }, "rest rejected"] });
     await expect(pollTransactionResult(fakeProvider([response]), "tx1")).rejects.toThrow("accepted the fee but rejected the rest");
+  });
+
+  it("throws a FeeCommittedError carrying the transaction id for AcceptFeeRejectRest", async () => {
+    const response = finalizedWith({ AcceptFeeRejectRest: [{ up_substates: [] }, "rest rejected"] });
+    const err = await pollTransactionResult(fakeProvider([response]), "tx9").catch((e) => e);
+    expect(err).toBeInstanceOf(FeeCommittedError);
+    expect(err.transactionId).toBe("tx9");
   });
 
   it("keeps polling through Pending responses until finalized", async () => {
@@ -669,5 +680,50 @@ describe("settlePrivatePaymentScan", () => {
 
   it("persists nothing when a pass saw no transactions at all", () => {
     expect(settlePrivatePaymentScan({ reachedCursor: false, newestSeen: null, lastId: null, pendingSeen: false })).toEqual({});
+  });
+});
+
+describe("recoverPendingShields with a private fee", () => {
+  const FEE = { feeResourceAddress: "resource_xtr", spentCommitment: "aa".repeat(32), changeCommitment: "bb".repeat(32), changeAmount: "99950000" };
+
+  beforeEach(() => {
+    configureOotleStorage(inMemoryAdapter());
+  });
+
+  async function seed() {
+    await addShieldedOutput(fakeRecord({ commitment: FEE.spentCommitment, amount: "100000000" }));
+    await addPendingShield({ transactionId: "tx-fee-only", accountId: "local:0", resourceAddress: "resource_xtr", amount: "100000000", ownCommitment: "cc".repeat(32), privateFee: FEE });
+  }
+
+  it("records the fee change and spends the fee input when only the fee phase committed", async () => {
+    await seed();
+    const response = finalizedWith({ AcceptFeeRejectRest: [{ up_substates: [] }, "revealed balance too low"] });
+    await recoverPendingShields({ getTransactionResult: async () => response } as unknown as IndexerProvider);
+
+    const records = await listShieldedOutputs("local:0");
+    expect(records.find((r) => r.commitment === FEE.changeCommitment)).toMatchObject({ amount: FEE.changeAmount, spent: false });
+    expect(records.find((r) => r.commitment === FEE.spentCommitment)?.spent).toBe(true);
+    // The shield itself never happened, so its own output is not recorded.
+    expect(records.find((r) => r.commitment === "cc".repeat(32))).toBeUndefined();
+    expect(await listPendingShields()).toHaveLength(0);
+  });
+
+  it("is idempotent when run again", async () => {
+    await seed();
+    const response = finalizedWith({ AcceptFeeRejectRest: [{ up_substates: [] }, "nope"] });
+    const provider = { getTransactionResult: async () => response } as unknown as IndexerProvider;
+    await recoverPendingShields(provider);
+    await addPendingShield({ transactionId: "tx-fee-only", accountId: "local:0", resourceAddress: "resource_xtr", amount: "1", privateFee: FEE });
+    await recoverPendingShields(provider);
+    expect((await listShieldedOutputs("local:0")).filter((r) => r.commitment === FEE.changeCommitment)).toHaveLength(1);
+  });
+
+  it("records nothing when the transaction was rejected outright", async () => {
+    await seed();
+    const response: IndexerGetTransactionResultResponse = { result: { Rejected: { details: "bad", rejected_time: "" } } };
+    await recoverPendingShields({ getTransactionResult: async () => response } as unknown as IndexerProvider);
+    const records = await listShieldedOutputs("local:0");
+    expect(records.find((r) => r.commitment === FEE.changeCommitment)).toBeUndefined();
+    expect(records.find((r) => r.commitment === FEE.spentCommitment)?.spent).toBe(false);
   });
 });

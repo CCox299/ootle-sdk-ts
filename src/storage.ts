@@ -70,6 +70,12 @@ export interface PendingShield {
   ownCommitment?: string;
   /** This account's own memo for the operation, if any. */
   memo?: string;
+  /**
+   * The private fee this transaction pays, if any. Stored with the pending entry because the fee phase
+   * commits on its own: an `AcceptFeeRejectRest` result still spends the fee UTXO and creates its
+   * change, so recovery must record that even when the operation itself did nothing.
+   */
+  privateFee?: { feeResourceAddress: string; spentCommitment: string; changeCommitment: string; changeAmount: string };
 }
 
 /**

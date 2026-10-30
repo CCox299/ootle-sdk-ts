@@ -133,6 +133,33 @@ import { fromHex, toHex } from "./vault.js";
  * for why this is single-UTXO only, and `selectPrivateFeeUtxo` for how one is chosen. */
 export type FeeType = { kind: "transparent" } | { kind: "private"; feeResourceAddress: string };
 
+/**
+ * A transaction the network committed with only its fee phase: the fee was charged (so a private fee's
+ * input is spent and its change output exists) but the operation itself was rejected. The message
+ * keeps the "accepted the fee but rejected the rest" wording callers already match on.
+ */
+export class FeeCommittedError extends Error {
+  constructor(
+    readonly transactionId: string,
+    detail: string,
+  ) {
+    super(`Transaction ${transactionId} accepted the fee but rejected the rest: ${detail}`);
+    this.name = "FeeCommittedError";
+  }
+}
+
+/** The fee committed on-chain but recording it locally failed; the pending entry must be kept so
+ * `recoverPendingShields()` can finish the job. */
+export class FeeBookkeepingError extends Error {
+  constructor(
+    readonly transactionId: string,
+    cause: unknown,
+  ) {
+    super(`Transaction ${transactionId} charged its private fee but the wallet could not record the change output: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "FeeBookkeepingError";
+  }
+}
+
 /** Everything needed to attach and later account for a private fee spend, produced by
  * `OotleAccount.buildPrivateFeeInstructions` plus the UTXO it consumed. */
 type PrivateFeeMaterial = {
@@ -686,6 +713,17 @@ export class OotleAccount implements WalletAccountApi {
         }
         return withTransactionId(result);
       } catch (e) {
+        // The fee phase committed even though the main instructions failed: the private fee's UTXO is
+        // spent and its change exists. Record that now, and don't retry -- the retry would reuse the
+        // spent fee input.
+        if (e instanceof FeeCommittedError && privateFee && feeType.kind === "private") {
+          try {
+            await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, e.transactionId);
+          } catch (recordError) {
+            throw new FeeBookkeepingError(e.transactionId, recordError);
+          }
+          throw e;
+        }
         if (!(e instanceof Error) || attempt >= maxRetries) throw e;
 
         // No amount of retrying fixes an empty fee vault — surface this immediately instead of
@@ -1172,16 +1210,22 @@ export class OotleAccount implements WalletAccountApi {
     const { transactionId, spec, privateFee } = await this.prepareSignSubmit(builder, provider, account, maxFee, feeType);
     const ownCommitment = extractOutputCommitment(spec, 0);
 
-    await addPendingShield({ transactionId, accountId, resourceAddress, amount: amount.toString(), ownCommitment, memo });
+    await addPendingShield({ transactionId, accountId, resourceAddress, amount: amount.toString(), ownCommitment, memo, privateFee: journalFee(feeType, privateFee) });
+    let keepPending = false;
     try {
-      const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the shield transaction");
+      const response = await this.pollRecordingFee(accountId, feeType, privateFee, transactionId, () =>
+        withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the shield transaction"),
+      );
       await recordKnownVersions(response);
       await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, amount, transactionId, memo);
       if (privateFee && feeType.kind === "private") {
         await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
       }
+    } catch (e) {
+      keepPending = e instanceof FeeBookkeepingError;
+      throw e;
     } finally {
-      await removePendingShield(transactionId);
+      if (!keepPending) await removePendingShield(transactionId);
     }
     // The commitment and its substate id are returned, not just the transaction id, because they are
     // the only durable handle on the output this created -- and with a non-zero
@@ -1367,9 +1411,13 @@ export class OotleAccount implements WalletAccountApi {
         spentCommitments: commitments,
         ownCommitment,
         memo,
+        privateFee: journalFee(feeType, privateFee),
       });
+      let keepPending = false;
       try {
-        const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the unshield transaction");
+        const response = await this.pollRecordingFee(accountId, feeType, privateFee, transactionId, () =>
+          withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the unshield transaction"),
+        );
         await recordKnownVersions(response);
         await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, remainder, transactionId, memo);
         for (const commitment of commitments) {
@@ -1378,8 +1426,11 @@ export class OotleAccount implements WalletAccountApi {
         if (privateFee && feeType.kind === "private") {
           await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
         }
+      } catch (e) {
+        keepPending = e instanceof FeeBookkeepingError;
+        throw e;
       } finally {
-        await removePendingShield(transactionId);
+        if (!keepPending) await removePendingShield(transactionId);
       }
       return { transactionId };
     } finally {
@@ -1428,7 +1479,9 @@ export class OotleAccount implements WalletAccountApi {
     const builder = await this.buildWithdrawStealthAndExecute(provider, account, resourceAddress, amount, workspaceVarName, followUpInstructions, relatedComponents);
     const viewSecret = await this.signer.getViewSecret();
     const { transactionId, privateFee } = await this.prepareSignSubmit(builder as unknown as StealthTransfer, provider, account, maxFee, feeType, { viewSecret });
-    const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the transaction");
+    const response = await this.pollRecordingFee(localAccountId(this.index), feeType, privateFee, transactionId, () =>
+      withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the transaction"),
+    );
     await recordKnownVersions(response);
     if (privateFee && feeType.kind === "private") {
       await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
@@ -1634,7 +1687,9 @@ export class OotleAccount implements WalletAccountApi {
     );
     const envelope = privateFee ? await this.sealWithPrivateFee(authorized, privateFee.feeSigner) : await authorized.seal();
     const transactionId = await submitTransaction(provider, envelope);
-    const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the redemption transaction");
+    const response = await this.pollRecordingFee(localAccountId(this.index), feeType, privateFee, transactionId, () =>
+      withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the redemption transaction"),
+    );
     await recordKnownVersions(response);
     if (privateFee && feeType.kind === "private") {
       await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
@@ -1828,6 +1883,32 @@ export class OotleAccount implements WalletAccountApi {
   private async recordPrivateFeeSpend(accountId: string, feeResourceAddress: string, fee: PrivateFeeMaterial, transactionId: string) {
     await recordKnownShieldedOutput(accountId, feeResourceAddress, fee.feeChangeCommitment, fee.feeChangeAmount, transactionId);
     await markShieldedOutputSpent(accountId, fee.spentCommitment);
+  }
+
+  /**
+   * Runs `poll`; if the transaction committed with only its fee phase, records the private fee's
+   * spend and change first (they exist on-chain whatever happened to the main instructions), then
+   * rethrows. A bookkeeping failure surfaces as `FeeBookkeepingError` so the caller keeps its pending entry.
+   */
+  private async pollRecordingFee<T>(
+    accountId: string,
+    feeType: FeeType,
+    privateFee: PrivateFeeMaterial | null,
+    transactionId: string,
+    poll: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await poll();
+    } catch (e) {
+      if (e instanceof FeeCommittedError && privateFee && feeType.kind === "private") {
+        try {
+          await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
+        } catch (recordError) {
+          throw new FeeBookkeepingError(transactionId, recordError);
+        }
+      }
+      throw e;
+    }
   }
 
   /**
@@ -3082,9 +3163,13 @@ export class OotleAccount implements WalletAccountApi {
         amount: changeAmount.toString(),
         spentCommitments: commitments,
         ownCommitment,
+        privateFee: journalFee(feeType, privateFee),
       });
+      let keepPending = false;
       try {
-        const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private send");
+        const response = await this.pollRecordingFee(accountId, feeType, privateFee, transactionId, () =>
+          withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private send"),
+        );
         await recordKnownVersions(response);
         if (ownCommitment) await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, changeAmount, transactionId);
         for (const commitment of commitments) {
@@ -3093,8 +3178,11 @@ export class OotleAccount implements WalletAccountApi {
         if (privateFee && feeType.kind === "private") {
           await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
         }
+      } catch (e) {
+        keepPending = e instanceof FeeBookkeepingError;
+        throw e;
       } finally {
-        await removePendingShield(transactionId);
+        if (!keepPending) await removePendingShield(transactionId);
       }
       return {
         transactionId,
@@ -4333,6 +4421,20 @@ export async function recoverPendingShields(provider: IndexerProvider): Promise<
       }
       const outcome = result.Finalized.execution_result?.finalize.result;
       const succeeded = outcome && typeof outcome === "object" && "Accept" in outcome;
+      const committed = result.Finalized.final_decision === "Commit";
+      const feeOnly = committed && !!outcome && typeof outcome === "object" && "AcceptFeeRejectRest" in outcome;
+      // The fee phase commits on its own, so a private fee's UTXO is spent and its change exists
+      // whether the whole transaction succeeded or only its fee half did.
+      if (p.privateFee && committed && (succeeded || feeOnly)) {
+        await recordKnownShieldedOutput(
+          p.accountId,
+          p.privateFee.feeResourceAddress,
+          p.privateFee.changeCommitment,
+          BigInt(p.privateFee.changeAmount),
+          p.transactionId,
+        );
+        await markShieldedOutputSpent(p.accountId, p.privateFee.spentCommitment);
+      }
       if (succeeded) {
         await recordKnownVersions(response);
         if (p.ownCommitment) {
@@ -4344,8 +4446,8 @@ export async function recoverPendingShields(provider: IndexerProvider): Promise<
           }
         }
       }
-      // Reject / AcceptFeeRejectRest: no stealth output was created either way, nothing to
-      // recover -- just stop waiting on it.
+      // Reject / AcceptFeeRejectRest: the operation's own outputs were never created, nothing more
+      // to recover -- just stop waiting on it.
       await removePendingShield(p.transactionId);
     } catch {
       // A transient network/indexer error checking one pending shield must not stop the rest
@@ -4580,7 +4682,7 @@ export async function pollTransactionResult(
         throw new Error(`Transaction ${transactionId} was rejected: ${JSON.stringify(outcome.Reject)}`);
       }
       if ("AcceptFeeRejectRest" in outcome) {
-        throw new Error(`Transaction ${transactionId} accepted the fee but rejected the rest: ${JSON.stringify(outcome.AcceptFeeRejectRest)}`);
+        throw new FeeCommittedError(transactionId, JSON.stringify(outcome.AcceptFeeRejectRest));
       }
     }
     return response;

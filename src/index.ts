@@ -92,6 +92,8 @@ export {
   forgetKnownVersions,
   pollTransactionResult,
   recoverPendingShields,
+  FeeCommittedError,
+  FeeBookkeepingError,
   resetKnownVersions,
   resolveInputsWithRetry,
   resolveSendPrivatelyPlan,
