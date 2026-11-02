@@ -16,7 +16,8 @@ import {
   XTR_FAUCET_VAULT_ADDRESS,
   amountLiteral,
   createOutput,
-  decryptOwnedUtxo,
+  decryptOwnedUtxo as upstreamDecryptOwnedUtxo,
+  decryptInputData as upstreamDecryptInputData,
   defaultIndexerUrl,
   getVaultIdsForAccount,
   resolveMaxEpoch,
@@ -4826,7 +4827,41 @@ function describeSignedTx(signed: unknown): string {
   }
 }
 
-type StealthUtxo = { output: { output: { public_nonce: string }; auth?: Record<string, unknown> } };
+type StealthUtxo = { output: { output: { public_nonce: string; encrypted_data: string }; auth?: Record<string, unknown> } };
+
+/**
+ * `decryptOwnedUtxo` for a substate response in either shape. Upstream's expects the raw 0.48+
+ * response (`state.up.substate` a base64 CBOR string) and throws on an already-decoded one, but
+ * the SDK reads substates through `getSubstateDecoded`. So a decoded value is unpacked here and
+ * decrypted directly; a raw one goes to upstream. Returns null when the UTXO isn't a live,
+ * unfrozen stealth output of this view key.
+ */
+export async function decryptOwnedUtxo(
+  crypto: WasmStealthCrypto,
+  viewSecret: Uint8Array,
+  substate: unknown,
+  substateId: string
+): Promise<Awaited<ReturnType<typeof upstreamDecryptOwnedUtxo>>> {
+  const r = substate as { state?: { up?: { substate?: unknown } }; substate?: unknown };
+  const value = r?.state?.up?.substate ?? r?.substate;
+  if (typeof value === "string" || value === undefined) {
+    return upstreamDecryptOwnedUtxo(crypto, viewSecret, substate as never, substateId);
+  }
+  const utxo = (value as { Utxo?: StealthUtxo & { is_frozen?: boolean } }).Utxo;
+  if (!utxo || !utxo.output || utxo.is_frozen) return null;
+  const commitment = substateId.split("_").pop() ?? "";
+  if (!/^[0-9a-f]{64}$/i.test(commitment)) return null;
+  const body = utxo.output.output;
+  try {
+    return await upstreamDecryptInputData(crypto, fromHex(commitment), fromHex(body.encrypted_data), {
+      senderPublicNonce: fromHex(body.public_nonce),
+      viewSecret,
+      skipMemo: false,
+    });
+  } catch {
+    return null;
+  }
+}
 
 /**
  * The `Utxo` of an indexer substate response. Ootle 0.47 nests the value under `state.up.substate`;
