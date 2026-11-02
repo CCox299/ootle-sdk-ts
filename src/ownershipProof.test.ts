@@ -6,7 +6,8 @@
 // anyone (useless) or, far worse, replayable as spend authorization (unsafe) -- see
 // ownershipProof.ts's header comment for the threat this construction defends against.
 import { ristretto255 } from "@noble/curves/ed25519.js";
-import { publicKeyFromSecretKey, schnorrSign, stealthDhSecret } from "@tari-project/ootle-wasm";
+import { publicKeyFromSecretKey, stealthDhSecret } from "@tari-project/ootle-wasm";
+import { schnorrSign } from "@chironbuilder/ootle-wasm-legacy";
 import { describe, expect, it } from "vitest";
 import { DomainSeparatedHasher } from "./domainHash";
 import { buildOwnershipProofMessage, buildWalletOwnershipMessage, OWNERSHIP_PROOF_CHALLENGE_MAX_LENGTH } from "./ownershipProof";
@@ -127,11 +128,12 @@ describe("ownership proof signature (real wasm signer, independent verifier)", (
   it("end-to-end via the real stealth one-time key derivation (stealthDhSecret), matching OotleAccount.signOwnershipProof", () => {
     const network = 0x26; // Esmeralda
     const accountSecretBytes = scalarToBytesLE(randomScalar());
+    const viewSecretBytes = scalarToBytesLE(randomScalar());
     const senderNonceSecret = scalarToBytesLE(randomScalar());
     const senderPublicNonce = publicKeyFromSecretKey(senderNonceSecret);
 
     // What the receiver (this account) computes, exactly mirroring signOwnershipProof().
-    const oneTimeSecret = stealthDhSecret(network, accountSecretBytes, senderPublicNonce);
+    const oneTimeSecret = stealthDhSecret(network, accountSecretBytes, viewSecretBytes, senderPublicNonce);
     const oneTimePublicKey = publicKeyFromSecretKey(oneTimeSecret);
 
     const message = buildOwnershipProofMessage(network, "resource_xtr", "utxo_resource_xtr_deadbeef", "prove-carol-2026-09-03");
@@ -143,7 +145,7 @@ describe("ownership proof signature (real wasm signer, independent verifier)", (
     // owner receiving from the same sender) must not be able to produce a signature that verifies
     // against this account's one-time public key.
     const otherAccountSecret = scalarToBytesLE(randomScalar());
-    const otherOneTimeSecret = stealthDhSecret(network, otherAccountSecret, senderPublicNonce);
+    const otherOneTimeSecret = stealthDhSecret(network, otherAccountSecret, scalarToBytesLE(randomScalar()), senderPublicNonce);
     const forgedSig = schnorrSign(otherOneTimeSecret, message);
     expect(schnorrVerify(oneTimePublicKey, forgedSig.public_nonce, forgedSig.signature, message)).toBe(false);
   });

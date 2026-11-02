@@ -50,23 +50,25 @@ import {
   encryptedDataDhKdfAead,
   parseOotleAddress,
   publicKeyFromSecretKey,
-  schnorrSign,
   stealthDhSecret,
   unblindOutput,
   validateStealthTransfer,
 } from "@tari-project/ootle-wasm";
-// Burn-claim / confidential-withdraw crypto helpers were not upstreamed into
-// @tari-project/ootle-wasm@0.47.0; they are stable pure-crypto wrappers over
-// tari_ootle_wallet_crypto, kept from the vendored build.
+// Burn-claim / confidential-withdraw crypto helpers are not in upstream @tari-project/ootle-wasm;
+// they are stable pure-crypto wrappers over tari_ootle_wallet_crypto, kept in the vendored build.
+// `schnorrSign` (Ristretto Schnorr, for off-chain ownership proofs) was removed upstream in 0.48
+// when transaction signing moved to sr25519; the patched build keeps it. Rebuilt from v0.49.2 +
+// vendor/ootle-wasm-patched/chiron-0.49.2.patch.
 import {
   burnClaimStealthSecret,
   createConfidentialWithdrawProofLiteral,
+  schnorrSign,
   validateBurnClaimOwnershipProof,
 } from "@chironbuilder/ootle-wasm-legacy";
-// The HTLC-fund flow needs chironbuilds's StealthTransfer extensions (toRevealedOutputAsBucket /
-// andThen) that were not kept in the published @tari-project/ootle@0.47; routed through the
-// vendored build for this one flow. Validated by htlc.test.ts / htlcSafety.test.ts.
-import { StealthTransfer as HtlcStealthTransfer } from "@chironbuilder/ootle-legacy";
+// withdrawStealthAndExecute needs a revealed output left on the workspace as a bucket, which
+// upstream StealthTransfer doesn't offer; BucketStealthTransfer adds just that step.
+import { BucketStealthTransfer } from "./bucketStealthTransfer.js";
+import { decodeExecuteResultDeep, fetchSubstatesDecoded, getSubstateDecoded, getTransactionResultDecoded } from "./indexerDecode.js";
 import type { WalletAccountApi } from "./accountApi.js";
 import type { BurnClaimProofContents } from "./burnClaim.js";
 import { componentAddressFromWalletAddress, deriveAccountComponentAddress } from "./componentAddress.js";
@@ -292,7 +294,7 @@ async function fetchResourceMetadata(
   const nameByResource = new Map<string, string | null>();
   if (resourceIds.length === 0) return { divisibilityByResource, symbolByResource, nameByResource };
 
-  const { substates } = await withTimeout(provider.fetchSubstates(resourceIds), 15_000, "reading token decimal precision");
+  const { substates } = await withTimeout(fetchSubstatesDecoded(provider, resourceIds), 15_000, "reading token decimal precision");
   for (const id of resourceIds) {
     const value = substates[id]?.substate;
     const resource = value && "Resource" in value ? (value.Resource as { divisibility?: number; metadata?: Record<string, unknown> }) : undefined;
@@ -535,7 +537,7 @@ export class OotleAccount implements WalletAccountApi {
       unspentRecords.map(async (record) => {
         try {
           await withTimeout(
-            provider.getSubstate(stealthUtxoSubstateId(record.resourceAddress, fromHex(record.commitment))),
+            getSubstateDecoded(provider, stealthUtxoSubstateId(record.resourceAddress, fromHex(record.commitment))),
             15_000,
             "checking a shielded output",
           );
@@ -560,7 +562,7 @@ export class OotleAccount implements WalletAccountApi {
       nonFungibleTokenIds?: string[];
     }[] = [];
     if (vaultIds.length > 0) {
-      const { substates } = await withTimeout(provider.fetchSubstates(vaultIds), 15_000, "fetching vault balances");
+      const { substates } = await withTimeout(fetchSubstatesDecoded(provider, vaultIds), 15_000, "fetching vault balances");
       for (const id of vaultIds) {
         const substate: Substate | undefined = substates[id];
         const value = substate?.substate;
@@ -838,7 +840,9 @@ export class OotleAccount implements WalletAccountApi {
     }
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${body?.error?.message ?? text ?? res.statusText}`);
     if (body?.error) throw new Error(`${body.error.code}: ${body.error.message}`);
-    const response = body as { transaction_id: TransactionId; result: ExecuteResult };
+    const raw = body as unknown as { transaction_id: TransactionId; result: unknown };
+    // 0.48+: `result` is a base64 CBOR ExecuteResult.
+    const response = { ...raw, result: decodeExecuteResultDeep<ExecuteResult>(raw.result) };
 
     // A rejected dry-run comes back as a normal HTTP 200 with the rejection embedded in the
     // result (there's nothing to poll — dry runs never reach consensus). Throwing here, in the
@@ -947,7 +951,7 @@ export class OotleAccount implements WalletAccountApi {
       const provider = await this.getProvider();
       let recipientExists = true;
       try {
-        await withTimeout(provider.getSubstate(recipient), 15_000, "checking the recipient's account");
+        await withTimeout(getSubstateDecoded(provider, recipient), 15_000, "checking the recipient's account");
       } catch (e) {
         // A timeout means the indexer is degraded, not that the account is missing — creating one
         // on that assumption is how a working transfer turns into an "already UP" rejection.
@@ -1124,7 +1128,7 @@ export class OotleAccount implements WalletAccountApi {
             `max_epoch=${typeof t.max_epoch}:${JSON.stringify(t.max_epoch)}`,
             `nonce=${typeof t.nonce}:${JSON.stringify(t.nonce)}`,
             `dry_run=${JSON.stringify(t.dry_run)}`,
-            `is_seal_signer_authorized=${JSON.stringify(t.is_seal_signer_authorized)}`,
+            `main_signer=${JSON.stringify(t.main_signer)}`,
             `blobs=${Array.isArray(t.blobs) ? `array[${(t.blobs as unknown[]).length}]` : typeof t.blobs}`,
             `inputs=${JSON.stringify(t.inputs)}`,
             `fee_instructions=${JSON.stringify(t.fee_instructions)?.slice(0, 400)}`,
@@ -1257,7 +1261,7 @@ export class OotleAccount implements WalletAccountApi {
     challenge: string,
   ): Promise<{ publicKey: string; publicNonce: string; signature: string }> {
     const provider = await this.getProvider();
-    const response = await provider.getSubstate(substateId);
+    const response = await getSubstateDecoded(provider, substateId);
     // Ootle 0.47 nests the Utxo under `state.up.substate` (older responses carried it as
     // `substate` directly) -- `utxoOf` reads either, same as every other substate reader here.
     // Before this, the hard-coded `response.state.Utxo` read `undefined` on 0.47, so every
@@ -1272,7 +1276,7 @@ export class OotleAccount implements WalletAccountApi {
     }
 
     const senderPublicNonce = fromHex(utxo.output.output.public_nonce);
-    const oneTimeSecret = stealthDhSecret(this.network, this.ownerSecret, senderPublicNonce);
+    const oneTimeSecret = stealthDhSecret(this.network, this.ownerSecret, await this.signer.getViewSecret(), senderPublicNonce);
     try {
       const oneTimePublicKey = publicKeyFromSecretKey(oneTimeSecret);
       if (toHex(oneTimePublicKey) !== expectedAuthKeyHex) {
@@ -1535,18 +1539,13 @@ export class OotleAccount implements WalletAccountApi {
     // amount as a revealed bucket.
     const dust = 1n;
 
-    let builder = new HtlcStealthTransfer(provider, resourceAddress)
+    let builder = new BucketStealthTransfer(provider, resourceAddress)
       .withBuilder((b: any) => b.addInput({ substate_id: resourceAddress, version: null }))
       .spendRevealedInput(account, amount + dust)
       .toStealthOutput(createOutput({ destination: walletAddress, amount: dust, resourceAddress }))
-      .toRevealedOutputAsBucket(amount, workspaceVarName)
-      // The 0.47 patch requires every revealed output to name the public key allowed to take it
-      // (prepare() throws "a revealed output needs withRevealedReceiver(publicKey)" otherwise).
-      // `unshield`/`sendPrivately` fold this into `toRevealedOutput(amount, pubkey)`, but the
-      // legacy builder's `toRevealedOutputAsBucket` takes no receiver, so set it explicitly. The
-      // bucket is consumed by `followUpInstructions` in this same transaction, which is always
-      // signed with the account key — see `accountPublicKey`'s own doc comment (tari-ootle#2645).
-      .withRevealedReceiver(this.accountPublicKey)
+      // The revealed bucket names the key allowed to take it (tari-ootle#2645); it is consumed by
+      // `followUpInstructions` in this same transaction, always signed with the account key.
+      .toRevealedOutputAsBucket(amount, workspaceVarName, this.accountPublicKey)
       .andThen(followUpInstructions);
     // `spendRevealedInput` withdraws from this account's vault but doesn't register it as an input
     // (only the account component), so the engine rejects the withdraw with `vault_… not found`.
@@ -1778,7 +1777,7 @@ export class OotleAccount implements WalletAccountApi {
 
     const commitment = fromHex(feeCommitmentHex);
     const substateId = stealthUtxoSubstateId(feeResourceAddress, commitment);
-    const substate = await provider.getSubstate(substateId);
+    const substate = await getSubstateDecoded(provider, substateId);
     const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
     if (!decrypted) {
       throw new Error(`buildPrivateFeeInstructions: cannot decrypt ${substateId} -- it doesn't belong to this account, or is already spent.`);
@@ -1827,7 +1826,7 @@ export class OotleAccount implements WalletAccountApi {
     // (decryptOwnedUtxo above didn't return it) rather than parsed out of the substate response
     // type, whose shape `decryptOwnedUtxo` already validated once. Same convention
     // `redeemStealthOutputWithPrivateFee` used before this was extracted.
-    const feeSubstate = await provider.getSubstate(substateId);
+    const feeSubstate = await getSubstateDecoded(provider, substateId);
     const feeNonce = utxoOf(feeSubstate).output
       .output.public_nonce;
     const feeSigner: Signer = {
@@ -1835,7 +1834,7 @@ export class OotleAccount implements WalletAccountApi {
       getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
       signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
         const json = serializeUnsignedTx(tx);
-        const sig = await this.signer.addStealthSignature!(json, fromHex(feeNonce), sealPublicKey, { crypto });
+        const sig = await this.signer.addStealthSignature!(json, fromHex(feeNonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() });
         return [sig];
       },
     };
@@ -2008,7 +2007,7 @@ export class OotleAccount implements WalletAccountApi {
       if (record.spent || record.resourceAddress !== resourceAddress || BigInt(record.amount) <= floor) continue;
       try {
         const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(record.commitment));
-        if (await decryptOwnedUtxo(crypto, viewSecret, await provider.getSubstate(substateId), substateId)) return true;
+        if (await decryptOwnedUtxo(crypto, viewSecret, await getSubstateDecoded(provider, substateId), substateId)) return true;
       } catch {
         /* spent elsewhere or unreachable: not usable for the fee */
       }
@@ -2059,7 +2058,7 @@ export class OotleAccount implements WalletAccountApi {
       const inputs = await Promise.all(
         commitments.map(async (commitmentHex) => {
           const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex));
-          const substate = await provider.getSubstate(substateId);
+          const substate = await getSubstateDecoded(provider, substateId);
           const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
           if (!decrypted) throw new Error(`sendPrivately: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
           const nonce = utxoOf(substate).output.output
@@ -2105,7 +2104,7 @@ export class OotleAccount implements WalletAccountApi {
         builder.addInput({ substate_id: resourceAddress, version: null, is_write: false });
         for (const input of inputs) builder.addInput({ substate_id: input.substateId, version: null });
         const unsignedBody = builder.buildUnsignedTransaction();
-        unsignedBody.is_seal_signer_authorized = true;
+        unsignedBody.main_signer = "SealSigner";
         unsignedBody.dry_run = dryRun;
         const unsignedTx = await resolveTransaction(provider, unsignedBody);
         unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
@@ -2114,7 +2113,7 @@ export class OotleAccount implements WalletAccountApi {
           getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
           signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
             const json = serializeUnsignedTx(tx);
-            return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto })];
+            return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() })];
           },
         }));
         const signed = await signTransaction(signers, unsignedTx, sealKeypair);
@@ -2208,7 +2207,7 @@ export class OotleAccount implements WalletAccountApi {
       if (record.spent) continue;
       try {
         const substateId = stealthUtxoSubstateId(record.resourceAddress, fromHex(record.commitment));
-        const substate = await provider.getSubstate(substateId);
+        const substate = await getSubstateDecoded(provider, substateId);
         const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
         if (!decrypted) unreadable.add(record.commitment); // doesn't decrypt as ours -- don't offer it either
       } catch (e) {
@@ -2352,6 +2351,7 @@ export class OotleAccount implements WalletAccountApi {
     if (!res.ok || body?.error || !body?.result) {
       throw new Error(`The dry run failed: ${body?.error?.message ?? text ?? res.statusText}`);
     }
+    body.result = decodeExecuteResultDeep<ExecuteResult>(body.result);
     const outcome = body.result.finalize.result;
     if (typeof outcome === "object" && outcome !== null) {
       if ("Reject" in outcome) throw new Error(`The dry run was rejected: ${JSON.stringify(outcome.Reject)}`);
@@ -2380,7 +2380,7 @@ export class OotleAccount implements WalletAccountApi {
 
     const commitment = fromHex(commitmentHex);
     const substateId = stealthUtxoSubstateId(resourceAddress, commitment);
-    const substate = await provider.getSubstate(substateId);
+    const substate = await getSubstateDecoded(provider, substateId);
     const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
     if (!decrypted) {
       throw new Error(`redeemStealthOutputWithPrivateFee: cannot decrypt ${substateId} -- it doesn't belong to this account, or is already spent.`);
@@ -2439,7 +2439,7 @@ export class OotleAccount implements WalletAccountApi {
     // The redeemed input's one-time key co-signs the same way the fee input's does inside
     // `buildPrivateFeeInstructions` -- see this method's own doc comment for why no ordinary
     // account-key signature is added.
-    const redeemedSubstate = await provider.getSubstate(redeemed.substateId);
+    const redeemedSubstate = await getSubstateDecoded(provider, redeemed.substateId);
     const redeemedNonce = utxoOf(redeemedSubstate)
       .output.output.public_nonce;
     const redeemedSigner: Signer = {
@@ -2447,7 +2447,7 @@ export class OotleAccount implements WalletAccountApi {
       getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
       signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
         const json = serializeUnsignedTx(tx);
-        const sig = await this.signer.addStealthSignature!(json, fromHex(redeemedNonce), sealPublicKey, { crypto });
+        const sig = await this.signer.addStealthSignature!(json, fromHex(redeemedNonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() });
         return [sig];
       },
     };
@@ -2639,7 +2639,7 @@ export class OotleAccount implements WalletAccountApi {
         }
         if (record.resourceAddress !== resourceAddress) throw new Error(`htlcFund: ${commitment.slice(0, 12)}… holds ${record.resourceAddress}, not ${resourceAddress}.`);
         const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(record.commitment));
-        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, await provider.getSubstate(substateId), substateId);
+        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, await getSubstateDecoded(provider, substateId), substateId);
         if (!decrypted || decrypted.value !== BigInt(record.amount)) {
           throw new Error(`htlcFund: ${commitment.slice(0, 12)}… is not spendable as recorded (already spent, or its on-chain value differs).`);
         }
@@ -2671,7 +2671,7 @@ export class OotleAccount implements WalletAccountApi {
     const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex));
     let substate: Awaited<ReturnType<IndexerProvider["getSubstate"]>> | null = null;
     try {
-      substate = await provider.getSubstate(substateId);
+      substate = await getSubstateDecoded(provider, substateId);
     } catch {
       substate = null;
     }
@@ -2738,7 +2738,7 @@ export class OotleAccount implements WalletAccountApi {
     const decrypted = await decryptOwnedUtxo(
       new WasmStealthCrypto(this.network),
       await this.signer.getViewSecret(),
-      await provider.getSubstate(substateId),
+      await getSubstateDecoded(provider, substateId),
       substateId
     );
     if (!decrypted) throw new Error("htlcClaim: the HTLC output no longer decrypts — it may have just been claimed or refunded.");
@@ -2993,7 +2993,7 @@ export class OotleAccount implements WalletAccountApi {
             continue;
           }
         }
-        const response = await provider.getTransactionResult(txId);
+        const response = await getTransactionResultDecoded(provider, txId);
         const result = response.result;
         if (result === "Pending") {
           out.push(current);
@@ -3005,7 +3005,7 @@ export class OotleAccount implements WalletAccountApi {
           out.push(current);
           continue;
         }
-        const outcome = result.Finalized.execution_result?.finalize.result;
+        const outcome = decodeExecuteResultDeep<ExecuteResult | null>(result.Finalized.execution_result)?.finalize.result;
         if (outcome && typeof outcome === "object" && "Accept" in outcome) {
           await this.finalizeHtlcEntry({ ...entry, transactionId: txId }, response);
           current = (await getHtlcJournalEntry(entry.id)) ?? current;
@@ -3213,7 +3213,7 @@ export class OotleAccount implements WalletAccountApi {
     }
     const provider = await this.getProvider();
     const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex));
-    const substate = await provider.getSubstate(substateId);
+    const substate = await getSubstateDecoded(provider, substateId);
     const viewSecret = await this.signer.getViewSecret();
     const decrypted = await decryptOwnedUtxo(new WasmStealthCrypto(this.network), viewSecret, substate, substateId);
     if (!decrypted) {
@@ -3287,7 +3287,7 @@ export class OotleAccount implements WalletAccountApi {
   private async hasPublicVault(provider: IndexerProvider, account: string, resourceAddress: string): Promise<boolean> {
     const vaultIds = await getVaultIdsForAccount(provider, account);
     if (vaultIds.length === 0) return false;
-    const { substates } = await withTimeout(provider.fetchSubstates(vaultIds), 15_000, "checking this account's vaults");
+    const { substates } = await withTimeout(fetchSubstatesDecoded(provider, vaultIds), 15_000, "checking this account's vaults");
     for (const id of vaultIds) {
       const value = substates[id]?.substate;
       if (!value || !("Vault" in value)) continue;
@@ -3330,7 +3330,7 @@ export class OotleAccount implements WalletAccountApi {
     const inputs = await Promise.all(
       commitments.map(async (commitmentHex) => {
         const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex));
-        const substate = await provider.getSubstate(substateId);
+        const substate = await getSubstateDecoded(provider, substateId);
         const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
         if (!decrypted) throw new Error(`unshield: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
         const nonce = utxoOf(substate).output.output.public_nonce;
@@ -3372,7 +3372,7 @@ export class OotleAccount implements WalletAccountApi {
     }
     for (const input of inputs) builder.addInput({ substate_id: input.substateId, version: null });
     const unsignedBody = builder.buildUnsignedTransaction();
-    unsignedBody.is_seal_signer_authorized = true;
+    unsignedBody.main_signer = "SealSigner";
     const unsignedTx = await resolveTransaction(provider, unsignedBody);
     unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
 
@@ -3381,7 +3381,7 @@ export class OotleAccount implements WalletAccountApi {
       getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
       signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
         const json = serializeUnsignedTx(tx);
-        return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto })];
+        return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() })];
       },
     }));
     const signed = await signTransaction(signers, unsignedTx, { secret_key: this.ownerSecret, public_key: ownerPublicKey });
@@ -3439,7 +3439,7 @@ export class OotleAccount implements WalletAccountApi {
     const inputs = await Promise.all(
       commitments.map(async (commitmentHex) => {
         const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex));
-        const substate = await provider.getSubstate(substateId);
+        const substate = await getSubstateDecoded(provider, substateId);
         const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
         if (!decrypted) throw new Error(`unshield: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
         const nonce = utxoOf(substate).output.output
@@ -3506,7 +3506,7 @@ export class OotleAccount implements WalletAccountApi {
       builder.addInput({ substate_id: resourceAddress, version: null, is_write: false });
       for (const input of inputs) builder.addInput({ substate_id: input.substateId, version: null });
       const unsignedBody = builder.buildUnsignedTransaction();
-      unsignedBody.is_seal_signer_authorized = true;
+      unsignedBody.main_signer = "SealSigner";
       unsignedBody.dry_run = dryRun;
       const unsignedTx = await resolveTransaction(provider, unsignedBody);
       unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
@@ -3515,7 +3515,7 @@ export class OotleAccount implements WalletAccountApi {
         getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
         signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
           const json = serializeUnsignedTx(tx);
-          return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto })];
+          return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() })];
         },
       }));
       const signed = await signTransaction(signers, unsignedTx, sealKeypair);
@@ -3609,7 +3609,7 @@ export class OotleAccount implements WalletAccountApi {
       // The seal key `s` is the transaction's only signer, so it must be authorized as the main
       // signer; the TS builder leaves that off by default.
       const unsignedBody = builder.buildUnsignedTransaction();
-      unsignedBody.is_seal_signer_authorized = true;
+      unsignedBody.main_signer = "SealSigner";
       unsignedBody.dry_run = dryRun;
       const unsignedTx = await resolveTransaction(provider, unsignedBody);
       unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
@@ -3637,6 +3637,7 @@ export class OotleAccount implements WalletAccountApi {
     if (!res.ok || body?.error || !body?.result) {
       throw new Error(`Could not estimate the ${what} fee: ${body?.error?.message ?? text ?? res.statusText}`);
     }
+    body.result = decodeExecuteResultDeep<ExecuteResult>(body.result);
     const finalize = body.result.finalize;
     const outcome = finalize.result;
     if (typeof outcome === "object" && outcome !== null && "Reject" in outcome) {
@@ -3860,13 +3861,13 @@ export class OotleAccount implements WalletAccountApi {
     const checkTransaction = async (transactionId: string): Promise<void> => {
       let response;
       try {
-        response = await provider.getTransactionResult(transactionId);
+        response = await getTransactionResultDecoded(provider, transactionId);
       } catch {
         return;
       }
       const result = response.result;
       if (result === "Pending" || "Rejected" in result) return;
-      const outcome = result.Finalized.execution_result?.finalize.result;
+      const outcome = decodeExecuteResultDeep<ExecuteResult | null>(result.Finalized.execution_result)?.finalize.result;
       const upSubstates =
         outcome && typeof outcome === "object" && "Accept" in outcome
           ? outcome.Accept.up_substates
@@ -3879,7 +3880,7 @@ export class OotleAccount implements WalletAccountApi {
         if (!substateId.startsWith(prefix)) continue;
         const commitment = substateId.slice(prefix.length);
         if (knownCommitments.has(commitment)) continue;
-        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, await provider.getSubstate(substateId), substateId);
+        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, await getSubstateDecoded(provider, substateId), substateId);
         if (!decrypted) continue;
         const memo = fromMemo(decrypted.memo);
         await recordKnownShieldedOutput(accountId, resourceAddress, commitment, decrypted.value, transactionId, memo);
@@ -3928,15 +3929,14 @@ export class OotleAccount implements WalletAccountApi {
    * directly, so it finds any output that exists on-chain right now regardless of how old it is or
    * how it was created.
    *
-   * **Full paginated mode (default):** Pages through the live UTXO set (`GET /utxos`) ordered by
-   * commitment id. Each call reads at most `maxPages` pages and saves its cursor, so a large set
-   * is covered across several calls rather than in one unbounded loop; the cursor is cleared once
-   * the last page is reached, and the next call starts a fresh sweep.
+   * **Full mode (default):** Sweeps every live UTXO of the resource (`POST /utxos/stream` with
+   * `unspent_only`, from genesis; 0.48 removed `GET /utxos`). Each call reads at most `maxPages`
+   * passes and saves its cursor, so a large set is covered across several calls; the cursor is
+   * cleared once every shard is read, and the next call starts a fresh sweep.
    *
-   * **Incremental mode** (`mode: "delta"`): Uses `POST /utxos/stream` with saved shard watermarks.
-   * Not the default: against the Esmeralda indexer on 2026-10-27 it returned an empty body for an
-   * empty-watermark request (observed only; the endpoint's intended semantics are unverified).
-   * Spent updates from it are recorded as *inferred* spends, which a later sighting can undo.
+   * **Incremental mode** (`mode: "delta"`): `POST /utxos/stream` from saved shard watermarks,
+   * including spends. Spent updates are recorded as *inferred* spends, which a later sighting can
+   * undo.
    *
    * Any owned output seen in the live set that a local record had marked spent only on an
    * indexer's say-so is revived (see `reviveShieldedOutput`).
@@ -4271,7 +4271,7 @@ export function isSpentElsewhere(record: Pick<ShieldedOutputRecord, "createdAt">
 /** Whether a stealth UTXO no longer exists (the indexer says not found). Any other failure: assume it does. */
 async function utxoGone(provider: IndexerProvider, resourceAddress: string, commitmentHex: string): Promise<boolean> {
   try {
-    await provider.getSubstate(stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex)));
+    await getSubstateDecoded(provider, stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex)));
     return false;
   } catch (e) {
     return /[^0-9]404[^0-9]|not found/i.test(` ${e instanceof Error ? e.message : String(e)} `);
@@ -4412,14 +4412,14 @@ export async function recoverPendingShields(provider: IndexerProvider): Promise<
   const pending = await listPendingShields();
   for (const p of pending) {
     try {
-      const response = await provider.getTransactionResult(p.transactionId);
+      const response = await getTransactionResultDecoded(provider, p.transactionId);
       const result = response.result;
       if (result === "Pending") continue; // still in flight -- leave it for next time
       if ("Rejected" in result) {
         await removePendingShield(p.transactionId);
         continue;
       }
-      const outcome = result.Finalized.execution_result?.finalize.result;
+      const outcome = decodeExecuteResultDeep<ExecuteResult | null>(result.Finalized.execution_result)?.finalize.result;
       const succeeded = outcome && typeof outcome === "object" && "Accept" in outcome;
       const committed = result.Finalized.final_decision === "Commit";
       const feeOnly = committed && !!outcome && typeof outcome === "object" && "AcceptFeeRejectRest" in outcome;
@@ -4564,7 +4564,7 @@ export function dedupeInputs<T extends SubstateRequirement>(inputs: readonly T[]
 async function recordKnownVersions(response: IndexerGetTransactionResultResponse): Promise<void> {
   const result = response.result;
   if (result === "Pending" || "Rejected" in result) return;
-  const outcome = result.Finalized.execution_result?.finalize.result;
+  const outcome = decodeExecuteResultDeep<ExecuteResult | null>(result.Finalized.execution_result)?.finalize.result;
   const upSubstates =
     outcome && typeof outcome === "object" && "Accept" in outcome
       ? outcome.Accept.up_substates
@@ -4602,7 +4602,7 @@ async function recordKnownVersions(response: IndexerGetTransactionResultResponse
 function withTransactionId<T extends IndexerGetTransactionResultResponse>(response: T): T & { transactionId?: string } {
   const result = response.result;
   if (result === "Pending" || "Rejected" in result) return response;
-  const transactionHash = result.Finalized.execution_result?.finalize.transaction_hash;
+  const transactionHash = decodeExecuteResultDeep<ExecuteResult | null>(result.Finalized.execution_result)?.finalize.transaction_hash;
   return transactionHash !== undefined ? { ...response, transactionId: transactionHash } : response;
 }
 
@@ -4642,7 +4642,7 @@ export async function pollTransactionResult(
   for (;;) {
     let response: IndexerGetTransactionResultResponse;
     try {
-      response = await provider.getTransactionResult(transactionId);
+      response = await getTransactionResultDecoded(provider, transactionId);
     } catch (err) {
       // A transaction the indexer hasn't ingested yet (submitted moments ago, not yet in its
       // local view) surfaces as a plain 404 "not found" -- the same race resolveInputsWithRetry
@@ -4676,7 +4676,7 @@ export async function pollTransactionResult(
       const details = result.Finalized.abort_details ? `: ${result.Finalized.abort_details}` : "";
       throw new Error(`Transaction ${transactionId} was aborted (${reason})${details}`);
     }
-    const outcome = result.Finalized.execution_result?.finalize.result;
+    const outcome = decodeExecuteResultDeep<ExecuteResult | null>(result.Finalized.execution_result)?.finalize.result;
     if (outcome && typeof outcome === "object") {
       if ("Reject" in outcome) {
         throw new Error(`Transaction ${transactionId} was rejected: ${JSON.stringify(outcome.Reject)}`);
@@ -4791,7 +4791,7 @@ function describeResolvedTx(resolved: unknown): string {
     const keys = Object.keys(tx).join(",");
     const inputs = Array.isArray(tx.inputs) ? (tx.inputs as unknown[]) : [];
     const sample = inputs.slice(0, 3).map((i) => JSON.stringify(i)).join(" ");
-    const missing = ["network", "fee_instructions", "instructions", "inputs", "max_epoch", "is_seal_signer_authorized", "dry_run"]
+    const missing = ["network", "fee_instructions", "instructions", "inputs", "max_epoch", "main_signer", "dry_run", "blobs", "nonce"]
       .filter((k) => !(k in tx));
     return [
       `keys=[${keys}]`,

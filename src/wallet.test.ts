@@ -227,7 +227,7 @@ describe("pollTransactionResult", () => {
   it("returns the response immediately on a successful Finalized/Accept result", async () => {
     const response = finalizedWith({ Accept: { up_substates: [], down_substates: [] } });
     const result = await pollTransactionResult(fakeProvider([response]), "tx1");
-    expect(result).toBe(response);
+    expect(result).toStrictEqual(response);
   });
 
   it("throws on a Rejected result", async () => {
@@ -256,7 +256,7 @@ describe("pollTransactionResult", () => {
     const finalized = finalizedWith({ Accept: { up_substates: [], down_substates: [] } });
     const provider = fakeProvider([{ result: "Pending" }, finalized]);
     const result = await pollTransactionResult(provider, "tx1", 60_000);
-    expect(result).toBe(finalized);
+    expect(result).toStrictEqual(finalized);
   });
 
   it("times out if the transaction stays Pending past timeoutMs", async () => {
