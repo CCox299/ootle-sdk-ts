@@ -2427,6 +2427,12 @@ export class OotleAccount implements WalletAccountApi {
       .withInstructions(followUpInstructions);
     for (const instr of feeInstructions) builder.addFeeInstruction(instr);
     builder.addInput({ substate_id: resourceAddress, version: null }).addInput({ substate_id: redeemed.substateId, version: null });
+    // Only one-time stealth keys sign this transaction, never the account key. Left at "None",
+    // `signTransaction` would name the first signer's `getPublicKey()` (the account owner key) as
+    // the main signer, and Ootle >= 0.49 rejects a main signer that did not sign
+    // ("names <key> as its main signer, but <key> did not sign it"). The seal key is fresh per
+    // transaction, so authorizing it links nothing to the account.
+    builder.withMainSigner("SealSigner");
     for (const input of feeInputs) builder.addInput(input);
     for (const component of relatedComponents) {
       builder.addInput({ substate_id: component, version: null });
