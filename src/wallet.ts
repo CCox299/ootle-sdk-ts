@@ -3529,14 +3529,30 @@ export class OotleAccount implements WalletAccountApi {
       return { envelope: sealTransaction(signed), change, changeCommitment };
     };
 
-    // Any fee the balance can pay works as the dry run's probe; it only feeds the metered cost.
-    const payable = remainder + amount - 1n;
-    const probe = maxFee < payable ? maxFee : payable;
-    const fee = await this.estimateClaimFee(await build(probe, true), "unshield");
+    // The dry run must have the real transaction's shape, change output included, or it meters a
+    // cheaper transaction than the one sent. The probe only feeds the metered cost.
+    const probes = unshieldFeeProbes(remainder, amount, maxFee);
+    let fee = await this.estimateClaimFee(await build(probes.first, true), "unshield");
+    if (probes.withoutChange !== null && fee >= remainder) {
+      // A fee this large leaves no change, so the transaction sent has no change output to pay for.
+      const withoutChange = await this.estimateClaimFee(await build(probes.withoutChange, true), "unshield");
+      if (withoutChange >= remainder) fee = withoutChange;
+    }
     if (fee > maxFee) throw new Error(`unshield: creating the account costs ${fee}, above the ${maxFee} limit`);
-    const attempt = await build(fee, false);
-    const transactionId = await submitTransaction(provider, attempt.envelope);
-    const response = await withTimeout(pollTransactionResult(provider, transactionId), 90_000, "unshielding into a new account");
+    let attempt = await build(fee, false);
+    let transactionId = await submitTransaction(provider, attempt.envelope);
+    let response: IndexerGetTransactionResultResponse;
+    try {
+      response = await withTimeout(pollTransactionResult(provider, transactionId), 90_000, "unshielding into a new account");
+    } catch (e) {
+      // As in claimBurn: a shortfall aborts without spending anything, and names the fee it wanted.
+      const required = requiredFeeFromRejection(e);
+      if (required === null || required <= fee || required > maxFee) throw e;
+      fee = required;
+      attempt = await build(fee, false);
+      transactionId = await submitTransaction(provider, attempt.envelope);
+      response = await withTimeout(pollTransactionResult(provider, transactionId), 90_000, "unshielding into a new account");
+    }
     await recordKnownVersions(response);
     for (const input of inputs) await markShieldedOutputSpent(accountId, input.commitmentHex);
     if (attempt.changeCommitment) {
@@ -3653,6 +3669,10 @@ export class OotleAccount implements WalletAccountApi {
     const breakdown = (finalize.fee_receipt?.cost_breakdown?.breakdown ?? {}) as Record<string, bigint | number | string | undefined>;
     let charged = 0n;
     for (const amount of Object.values(breakdown)) if (amount !== undefined) charged += BigInt(amount);
+    // Since 0.50 a receipt can be charged less than committing the whole transaction costs. Mirrors
+    // the engine's FinalizeResult::required_fees; the field is absent from an older indexer's result.
+    const whole = (finalize as { total_fees_required?: bigint | number | string }).total_fees_required;
+    if (whole !== undefined && BigInt(whole) > charged) charged = BigInt(whole);
     if (charged === 0n) throw new Error(`Could not estimate the ${what} fee: the dry run reported no cost`);
     return charged + FEE_ESTIMATE_ALLOWANCE;
   }
@@ -4479,10 +4499,30 @@ function claimFeeProbe(burnValue: bigint): bigint {
   return burnValue > probe ? probe : burnValue - 1n;
 }
 
-/** The fee named by an `InsufficientFeesPaid` rejection ("Required fees N but M paid"), if any. */
-function requiredFeeFromRejection(e: unknown): bigint | null {
-  const match = /Required fees (\d+) but \d+ paid/.exec(e instanceof Error ? e.message : String(e));
+/**
+ * The fee named by an `InsufficientFeesPaid` rejection, if any. The engine words it three ways:
+ * "Required fees N but M paid", "Committing requires N but M paid" and
+ * "Insufficient fees paid: M, required fees: N".
+ */
+export function requiredFeeFromRejection(e: unknown): bigint | null {
+  const message = e instanceof Error ? e.message : String(e);
+  const match =
+    /(?:Required fees|Committing requires) (\d+) but \d+ paid/.exec(message) ??
+    /Insufficient fees paid: \d+, required fees: (\d+)/.exec(message);
   return match ? BigInt(match[1]!) : null;
+}
+
+/**
+ * The fees to dry-run a new-account unshield at. `first` leaves change whenever the private
+ * remainder can, so the dry run has the change output the real transaction will have; if the fee it
+ * measures would use up that remainder, `withoutChange` measures the cheaper change-free shape.
+ */
+export function unshieldFeeProbes(remainder: bigint, amount: bigint, maxFee: bigint): { first: bigint; withoutChange: bigint | null } {
+  const payable = remainder + amount - 1n;
+  const withoutChange = maxFee < payable ? maxFee : payable;
+  const roomForChange = remainder - 1n;
+  if (roomForChange <= 0n) return { first: withoutChange, withoutChange: null };
+  return { first: maxFee < roomForChange ? maxFee : roomForChange, withoutChange };
 }
 
 /**
