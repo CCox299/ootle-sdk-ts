@@ -39,15 +39,25 @@ export async function getSubstateDecoded(provider: IndexerProvider, substateId: 
   return decodeSubstateResponse(await provider.getSubstate(substateId, version));
 }
 
-/** `fetchSubstates` with each entry given the pre-0.48 `{ version, substate }` shape. */
-export async function fetchSubstatesDecoded(provider: IndexerProvider, ids: string[]): Promise<{ substates: Record<string, { version: number; substate: any } | undefined> }> {
-  const response = (await provider.fetchSubstates(ids as never)) as any;
+/** The most substates the indexer serves in one request. It refuses a larger one outright. */
+export const MAX_SUBSTATES_PER_REQUEST = 20;
+
+/**
+ * `fetchSubstates` with each entry given the pre-0.48 `{ version, substate }` shape. Asks in batches, because an account
+ * holding more than a batch's worth of tokens is ordinary: every campaign it claims from adds a receipt vault.
+ */
+export async function fetchSubstatesDecoded(provider: IndexerProvider, ids: string[]): Promise<{ substates: Record<string, { version: number; substate: any } | undefined> } & Record<string, any>> {
+  const batches: string[][] = [];
+  for (let i = 0; i < ids.length; i += MAX_SUBSTATES_PER_REQUEST) batches.push(ids.slice(i, i + MAX_SUBSTATES_PER_REQUEST));
+  const responses = (await Promise.all((batches.length ? batches : [[]]).map((batch) => provider.fetchSubstates(batch as never)))) as any[];
   const substates: Record<string, { version: number; substate: any } | undefined> = {};
-  for (const [id, entry] of Object.entries<any>(response.substates ?? {})) {
-    if (!entry) continue;
-    substates[id] = { ...entry, substate: substateValueOf(entry.value ?? entry.substate) };
+  for (const response of responses) {
+    for (const [id, entry] of Object.entries<any>(response.substates ?? {})) {
+      if (!entry) continue;
+      substates[id] = { ...entry, substate: substateValueOf(entry.value ?? entry.substate) };
+    }
   }
-  return { ...response, substates };
+  return { ...Object.assign({}, ...responses), substates };
 }
 
 /** Decodes `Finalized.execution_result` (and nested event blobs) in a transaction-result response. */
